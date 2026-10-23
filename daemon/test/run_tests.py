@@ -23,9 +23,12 @@ SOCKET_NAME = "qcom_efsd_test_%d" % os.getpid()
 
 passed = []
 failed = []
+PREFIX = []          # a label for the checks of a repeated suite
 
 
 def check(name, cond, detail=""):
+    if PREFIX:
+        name = "[%s] %s" % (PREFIX[-1], name)
     (passed if cond else failed).append(name)
     mark = "PASS" if cond else "FAIL"
     print("%-5s %s%s" % (mark, name, ("  -- " + str(detail)) if detail and not cond else ""))
@@ -50,7 +53,8 @@ class Client:
         return json.loads(line)
 
 
-def spawn(daemon_bin, tmp, tag, reject_hellos=0, datagram_header=False, extra=()):
+def spawn(daemon_bin, tmp, tag, reject_hellos=0, datagram_header=False, extra=(),
+          framing="qrtr"):
     """Starts a mock modem plus a daemon wired to it; returns (mock, daemon, client, log)."""
     mock_sock = os.path.join(tmp, "modem-%s.sock" % tag)
     mock_log = os.path.join(tmp, "modem-%s.log" % tag)
@@ -58,7 +62,7 @@ def spawn(daemon_bin, tmp, tag, reject_hellos=0, datagram_header=False, extra=()
 
     args = [sys.executable, os.path.join(HERE, "mock_modem.py"),
             mock_sock, mock_log, str(reject_hellos),
-            "1" if datagram_header else "0"]
+            "1" if datagram_header else "0", framing]
     mock = subprocess.Popen(args, stdout=subprocess.PIPE)
     if mock.stdout.readline().strip() != b"ready":
         raise RuntimeError("mock modem failed to start")
@@ -66,7 +70,7 @@ def spawn(daemon_bin, tmp, tag, reject_hellos=0, datagram_header=False, extra=()
     log = open(os.path.join(tmp, "daemon-%s.log" % tag), "w+")
     daemon = subprocess.Popen(
         [daemon_bin, "-uid", str(os.getuid()), "-socket", name,
-         "-mock", mock_sock, "-verbose"] + list(extra),
+         "-mock", mock_sock, "-mock-framing", framing, "-verbose"] + list(extra),
         stdout=log, stderr=subprocess.STDOUT)
 
     deadline = time.time() + 5
@@ -118,6 +122,29 @@ def test_transport(daemon_bin, tmp):
         if daemon.poll() is None:
             daemon.kill()
         mock.kill()
+
+
+def test_devdiag(daemon_bin, tmp):
+    """The whole suite again over the /dev/diag container format, once for the
+    phone's own modem and once for an external one (the X55 case)."""
+    for framing, label in (("chardev", "/dev/diag"), ("mdm", "/dev/diag, external modem")):
+        sub = os.path.join(tmp, framing)
+        os.makedirs(sub, exist_ok=True)
+        mock, daemon, c, log = spawn(daemon_bin, sub, framing, framing=framing)
+        PREFIX.append(label)
+        try:
+            print()
+            run(c, sub)
+            r = c.cmd(cmd="stats")
+            check("unsolicited and foreign frames were dropped, not taken",
+                  r.get("rx_dropped", 0) > 0, r)
+        finally:
+            PREFIX.pop()
+            try:
+                c.cmd(cmd="shutdown")
+            except Exception:
+                pass
+            daemon.kill(); mock.kill()
 
 
 def test_ssr(daemon_bin, tmp):
@@ -217,6 +244,7 @@ def main():
         print()
         test_transport(daemon_bin, tmp)
         test_ssr(daemon_bin, tmp)
+        test_devdiag(daemon_bin, tmp)
     finally:
         try:
             client.cmd(cmd="shutdown")

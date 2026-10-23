@@ -47,11 +47,16 @@ change the modem until the lock in the toolbar is cleared by hand.
 ## Requirements
 
 * Root (Magisk/KernelSU). The helper is started through `su`.
-* DIAG over **QRTR**, service 4097. Modern phones ship no `/dev/diag` character
-  device — the `diagchar` driver is not built into the kernel (the vendor
-  partition usually runs `vendor.diag-router` instead) — and the modem publishes
-  DIAG straight onto QRTR. Nothing to configure: the helper enumerates the bus
-  and finds the node itself. SELinux is not touched.
+* DIAG over **QRTR**, service 4097, for a modem built into the SoC. Modern
+  phones ship no `/dev/diag` character device — the `diagchar` driver is not
+  built into the kernel (the vendor partition usually runs `vendor.diag-router`
+  instead) — and the modem publishes DIAG straight onto QRTR. Nothing to
+  configure: the helper enumerates the bus and finds the node itself.
+* **`/dev/diag`** for an external modem — the X55 next to a Snapdragon 865/870.
+  Its DIAG never appears on QRTR; it reaches the phone through `diagchar` as a
+  remote processor. The helper falls back to `/dev/diag` only when the bus has
+  no modem DIAG, so phones that work over QRTR are not affected. SELinux is not
+  touched on either path.
 * arm64. The helper builds for `aarch64` only (32-bit Qualcomm devices with a
   current EFS are essentially gone; add a second target in `daemon/build.sh` if
   you need one).
@@ -244,8 +249,34 @@ The transport needs no setup: no ioctls, no logging modes, no privileges beyond
 what root already has.
 
 Verified on an ASUS I007D (SM8350, Android 11) and a Galaxy S26 Ultra (SM8850,
-Android 16). On both, `diagchar` is absent from the kernel; there is no
-`/dev/diag` at all, which is why that path was removed from the helper.
+Android 16). On both, `diagchar` is absent from the kernel and there is no
+`/dev/diag` at all.
+
+Only the modem's own endpoint is used. A DIAG instance reads as
+`64 * processor + channel`, processor 0 being the modem: the modem answers on
+instance 1, while on an SM8250 the audio, sensor and compute DSPs publish 65,
+257 and 385. A DSP speaks DIAG but has no EFS behind it, so those are skipped.
+(This is read off the numbers seen on real phones, not taken from
+documentation.)
+
+### `/dev/diag`, for an external modem
+
+On Snapdragon 865/870 the modem is an X55 on PCIe. Its QMI services are on the
+QRTR bus but its DIAG is not: the kernel's `diagchar` driver owns the modem's
+DIAG channel and exposes it through `/dev/diag` as a remote processor
+(measured on a Poco F3). When the bus has no modem DIAG, the helper opens
+`/dev/diag`, asks the driver which remote processors exist
+(`DIAG_IOCTL_REMOTE_DEV`), switches its own descriptor to memory-device mode
+for the phone and the external modem, and frames requests the way `diagchar`
+expects: `[u32 type = 0x20][i32 token = -1][HDLC frame]`, the token addressing
+the external modem. Answers come back as `[u32 type][i32 count]` followed by
+entries, each `[len][data]`, or `[token][len][data]` when they come from the
+external modem; only those are taken, since the phone's own processors keep
+talking through the same device. The mode belongs to the descriptor and is
+given back when it closes.
+
+Tested against the mock in both forms (the phone's own modem and an external
+one, with decoy replies from the wrong side mixed in); not yet run on an X55.
 
 Run on SM8350: listing and entry types, `stat`/`readlink`, reading files longer
 than one packet, the item interface, a recursive backup (188 directories, 1270
@@ -408,6 +439,5 @@ from is in [NOTICE](NOTICE).
   EFS2 opcode numbering, which is what shipping modems agree with.
 * [QCSuper](https://github.com/P1sec/QCSuper), MobileInsight's `diag_revealer` —
   for documenting how DIAG works on Android. Their `/dev/diag` container framing
-  was reimplemented in earlier versions of the helper; that transport has since
-  been dropped in favour of DIAG over QRTR. No code was copied.
+  is reimplemented for the external-modem fallback. No code was copied.
 * [Qualcomm QMI Band Control](https://github.com/Fronsipswu/qcom-band-menu) — the "root daemon + abstract socket + Compose client" shape.

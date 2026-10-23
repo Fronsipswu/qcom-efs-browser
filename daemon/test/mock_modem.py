@@ -12,10 +12,20 @@ optionally preceded, as on SM8850 and newer, by a datagram header
 
     [u16 type = 8][u16 length of the rest]
 
-The command line is <socket> <log> [reject_hellos] [datagram_header].
+The command line is <socket> <log> [reject_hellos] [datagram_header] [framing].
 reject_hellos (argv[3], default 0) is the number of initial DIAG_HELLOs to
 swallow.  datagram_header (argv[4], default "0") turns the SM8850-style
 datagram header on ("1") or off ("0").
+
+framing (argv[5], default "qrtr") switches to the /dev/diag container format
+the helper falls back to for an external modem: "chardev" for the phone's own
+modem, "mdm" for an external one.  A request then arrives as
+[u32 type = 0x20][i32 token = -1, mdm only][HDLC frame], and every answer goes
+back as [u32 type][i32 count] + entries, each [len][data] or, from the
+external modem, [token][len][data].  Each answer is deliberately surrounded by
+traffic the helper must ignore: an unsolicited event frame in the same entry,
+and -- in mdm mode -- a decoy "bad command" reply from the phone's own side,
+which taking would fail every command.
 
 The modem restart the daemon's "ssr" command issues -- DIAG subsystem 0x25,
 command 3 -- is handled inline by the modem (it echoes and notes it), so no
@@ -70,6 +80,86 @@ ENOENT, EACCES, EEXIST, ENOTDIR, EPERM, ENOTEMPTY = 2, 13, 17, 20, 1, 39
 
 
 # ------------------------------------------------------------- framing ----
+
+
+USER_SPACE_DATA_TYPE = 0x20
+TOKEN_MDM = -1
+
+
+def crc16_x25(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFF
+
+
+def hdlc_encode(payload):
+    raw = payload + struct.pack("<H", crc16_x25(payload))
+    out = bytearray()
+    for b in raw:
+        if b in (0x7E, 0x7D):
+            out += bytes([0x7D, b ^ 0x20])
+        else:
+            out.append(b)
+    out.append(0x7E)
+    return bytes(out)
+
+
+def hdlc_decode(frame):
+    out = bytearray()
+    esc = False
+    for b in frame:
+        if b == 0x7E:
+            if not out and not esc:
+                continue
+            break
+        if esc:
+            out.append(b ^ 0x20)
+            esc = False
+        elif b == 0x7D:
+            esc = True
+        else:
+            out.append(b)
+    if len(out) < 3:
+        raise ValueError("short frame")
+    payload, crc = bytes(out[:-2]), struct.unpack("<H", bytes(out[-2:]))[0]
+    if crc16_x25(payload) != crc:
+        raise ValueError("bad crc")
+    return payload
+
+
+def unwrap_chardev(blob, mdm):
+    """The payload of a request in the /dev/diag container format."""
+    if len(blob) < 5:
+        raise ValueError("short write")
+    dtype = struct.unpack_from("<I", blob, 0)[0]
+    if dtype != USER_SPACE_DATA_TYPE:
+        raise ValueError("data type 0x%x" % dtype)
+    off = 4
+    if mdm:
+        token = struct.unpack_from("<i", blob, 4)[0]
+        if token != TOKEN_MDM:
+            raise ValueError("token %d, expected %d" % (token, TOKEN_MDM))
+        off = 8
+    return hdlc_decode(blob[off:])
+
+
+EVENT_FRAME = bytes([0x60, 0x03, 0x00, 0x11, 0x22, 0x33])    # an unsolicited event
+
+
+def wrap_chardev(reply, request, mdm):
+    """An answer as the driver hands it over, with company."""
+    entries = []
+    if mdm:
+        # The phone's own side answering too: must be ignored, not taken.
+        decoy = hdlc_encode(bytes([0x13]) + request[:8])
+        entries.append(struct.pack("<I", len(decoy)) + decoy)
+    data = hdlc_encode(EVENT_FRAME) + hdlc_encode(reply)
+    head = struct.pack("<i", TOKEN_MDM) if mdm else b""
+    entries.append(head + struct.pack("<I", len(data)) + data)
+    return struct.pack("<Ii", USER_SPACE_DATA_TYPE, len(entries)) + b"".join(entries)
 
 
 def wrap(payload, datagram_header=False):
@@ -544,7 +634,7 @@ class Modem:
 
 # --------------------------------------------------------------- server ----
 
-def serve(path, logpath, reject_hellos=0, datagram_header=False):
+def serve(path, logpath, reject_hellos=0, datagram_header=False, framing="qrtr"):
     if os.path.exists(path):
         os.unlink(path)
 
@@ -554,7 +644,7 @@ def serve(path, logpath, reject_hellos=0, datagram_header=False):
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     srv.bind(path)
     srv.listen(4)
-    log.write("mock modem listening on %s\n" % path)
+    log.write("mock modem listening on %s (%s framing)\n" % (path, framing))
     log.flush()
     print("ready", flush=True)
 
@@ -577,12 +667,25 @@ def serve(path, logpath, reject_hellos=0, datagram_header=False):
             if not blob:
                 break
 
-            reply = modem.handle(blob)
+            chardev = framing in ("chardev", "mdm")
+            if chardev:
+                try:
+                    request = unwrap_chardev(blob, framing == "mdm")
+                except ValueError as e:
+                    modem.note("malformed request ignored: %s" % e)
+                    continue
+            else:
+                request = blob
+
+            reply = modem.handle(request)
             if reply is None:
                 continue
 
             try:
-                conn.send(wrap(reply, datagram_header))
+                if chardev:
+                    conn.send(wrap_chardev(reply, request, framing == "mdm"))
+                else:
+                    conn.send(wrap(reply, datagram_header))
             except OSError:
                 # The client hung up mid-exchange -- which is exactly what the
                 # restart command looks like, since the daemon drops the
@@ -597,4 +700,5 @@ def serve(path, logpath, reject_hellos=0, datagram_header=False):
 if __name__ == "__main__":
     serve(sys.argv[1], sys.argv[2],
           int(sys.argv[3]) if len(sys.argv) > 3 else 0,
-          (sys.argv[4] if len(sys.argv) > 4 else "0") == "1")
+          (sys.argv[4] if len(sys.argv) > 4 else "0") == "1",
+          sys.argv[5] if len(sys.argv) > 5 else "qrtr")

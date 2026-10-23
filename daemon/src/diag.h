@@ -1,9 +1,13 @@
-/* diag.h -- Qualcomm DIAG transport over QRTR.
+/* diag.h -- Qualcomm DIAG transport: QRTR first, /dev/diag as the fallback.
  *
- * Phones stopped shipping the diagchar driver (/dev/diag) years ago; on every
- * device this was tried on, the node is absent and the modem publishes DIAG as
- * QRTR service 4097 instead.  A request goes out as one raw datagram and the
- * answer comes back wrapped:
+ * A modem built into the SoC publishes DIAG as QRTR service 4097, and newer
+ * phones no longer ship the diagchar driver (/dev/diag) at all.  An external
+ * modem -- the X55 next to a Snapdragon 865/870 -- is different: its DIAG
+ * reaches the phone through diagchar as a "remote" processor and never shows
+ * up on the bus, so for those the helper falls back to /dev/diag.
+ *
+ * Over QRTR a request goes out as one raw datagram and the answer comes back
+ * wrapped:
  *
  *   7E 01 <len16> <payload> 7E
  *
@@ -27,8 +31,9 @@
 #define DIAG_BAD_SEC_MODE_F   0x42
 
 enum {
-    DIAG_TP_QRTR = 0,      /* AF_QIPCRTR, service 4097        */
-    DIAG_TP_MOCK,          /* a unix socket, for the test rig */
+    DIAG_TP_QRTR = 0,      /* AF_QIPCRTR, service 4097                 */
+    DIAG_TP_MOCK,          /* a unix socket speaking the QRTR wrapper  */
+    DIAG_TP_CHARDEV,       /* /dev/diag (or the test rig's imitation)  */
 };
 
 #define QRTR_DIAG_SERVICE 4097
@@ -36,6 +41,8 @@ enum {
 typedef struct {
     int      fd;
     int      transport;
+    int      remote;           /* chardev: talking to the external modem    */
+    int      is_mock;          /* any of the test rig's transports          */
     uint32_t qrtr_node, qrtr_port;
     char     desc[64];         /* human-readable transport name */
     unsigned long rx_frames;
@@ -46,6 +53,13 @@ typedef struct {
 /* Talks to a unix SOCK_SEQPACKET socket instead of the QRTR bus, which is how
  * the test harness substitutes a mock modem.  Only the tests pass this. */
 void diag_set_mock(const char *path);
+
+/* How the test rig's socket frames DIAG: "qrtr" (the default), "chardev" for
+ * the /dev/diag container format, or "mdm" for that format addressed to an
+ * external modem. */
+void diag_set_mock_framing(const char *name);
+
+int  diag_is_mock(const diag_t *d);
 
 const char *diag_transport_desc(const diag_t *d);
 

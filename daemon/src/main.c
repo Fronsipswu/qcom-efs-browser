@@ -746,11 +746,11 @@ static void cmd_ssr(sbuf *o)
      * It needs no vendor endpoint -- it rides the ordinary DIAG transport, so
      * it works on any Qualcomm modem, not just Xiaomi's 0xFFE4 QMI service. */
     static const uint8_t req[4] = { DIAG_SUBSYS_CMD_F, 0x25, 0x03, 0x00 };
-    int was_mock = (g_diag.transport == DIAG_TP_MOCK);
+    int was_mock = diag_is_mock(&g_diag);
 
     /* Opened before the request goes out, or the announcements it is waiting
      * for would already have passed. */
-    int watch = was_mock ? -1 : diag_watch_open();
+    int watch = (g_diag.transport == DIAG_TP_QRTR) ? diag_watch_open() : -1;
 
     if (diag_send(&g_diag, req, sizeof req) < 0) {
         diag_watch_close(watch);
@@ -1047,6 +1047,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-rw"))                      g_readonly = 0;
         else if (!strcmp(argv[i], "-mock") && i + 1 < argc) {
             diag_set_mock(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "-mock-framing") && i + 1 < argc) {
+            diag_set_mock_framing(argv[++i]);
         }
         else if (!strcmp(argv[i], "-qrtr") && i + 1 < argc) {
             unsigned long node = 0, port = 0;
